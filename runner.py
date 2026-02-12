@@ -104,6 +104,7 @@ def run_two_stage(
     quality_weight_mode: str = "auto",
     quality_floor: float = 0.1,
     quality_exponent: float = 1.0,
+    quality_rank_weight: float = 0.3,
     # ---- Stage 2 ----
     adapter_bottleneck: int = 64,
     lambda_recon: float = 1.0,
@@ -186,6 +187,7 @@ def run_two_stage(
         quality_weight_mode=quality_weight_mode,
         quality_floor=quality_floor,
         quality_exponent=quality_exponent,
+        quality_rank_weight=quality_rank_weight,
     ):
         pass
 
@@ -334,6 +336,8 @@ def build_argparser() -> argparse.ArgumentParser:
                help="Stage1: minimum quality weight for any modality (prevents total silencing).")
     p.add_argument("--quality_exponent", type=float, default=1.0,
                help="Stage1: exponent applied to (1 - mean_cosine_sim) when computing quality weights.")
+    p.add_argument("--quality_rank_weight", type=float, default=0.3,
+               help="Stage1: weight of effective-rank signal in quality score (0=pure discriminability, 1=pure rank).")
 
 
     # Stage 2
@@ -422,6 +426,7 @@ def main():
         quality_weight_mode=args.quality_weight_mode,
         quality_floor=args.quality_floor,
         quality_exponent=args.quality_exponent,
+        quality_rank_weight=args.quality_rank_weight,
         stable_list_mode=args.stable_list_mode,
         two_phase=args.two_phase,
         phase1_lambda_anchor=args.phase1_lambda_anchor,

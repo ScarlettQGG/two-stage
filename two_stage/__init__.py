@@ -172,6 +172,43 @@ def _collate_protein_batch(batch):
     batch_mask = {m: torch.tensor([md.get(m, 0.0) for md in mask_dicts], dtype=torch.float32) for m in modalities}
     return batch_data, batch_mask, list(idxs)
 
+def _effective_rank_fraction(X: np.ndarray, eps: float = 1e-8) -> float:
+    """
+    Effective rank of rows of *X* as a fraction of the maximum possible rank.
+
+    Effective rank = exp(Shannon entropy of the normalised eigenvalue spectrum
+    of the covariance matrix).  A value near 1.0 means the embeddings span the
+    full space; a value near 0.0 means they have collapsed onto a
+    low-dimensional manifold.
+
+    Parameters
+    ----------
+    X : ndarray [N, D]
+        Data matrix (does **not** need to be centred or normalised beforehand).
+    eps : float
+        Small constant for numerical stability.
+
+    Returns
+    -------
+    float in (0, 1]
+    """
+    N, D = X.shape
+    centered = X - X.mean(axis=0, keepdims=True)
+    cov = (centered.T @ centered) / max(N - 1, 1)       # [D, D]
+    eigenvalues = np.linalg.eigvalsh(cov)                # [D]
+    eigenvalues = np.clip(eigenvalues, 0, None)
+
+    total = eigenvalues.sum()
+    if total < eps:
+        return 0.0
+
+    p = eigenvalues / total                              # normalised spectrum
+    entropy = -(p * np.log(p + eps)).sum()
+    effective_rank = float(np.exp(entropy))
+    max_rank = min(N, D)
+    return effective_rank / max_rank
+
+
 def compute_modality_quality_weights(
     modalities_dict: Dict[str, Dict[str, np.ndarray]],
     base_of: Dict[str, str],
@@ -180,18 +217,30 @@ def compute_modality_quality_weights(
     seed: int = 0,
     floor: float = 0.1,
     exponent: float = 1.0,
+    rank_weight: float = 0.3,
     eps: float = 1e-8,
 ) -> Dict[str, float]:
     """
-    Per-base modality quality weight based on pairwise discriminability.
+    Per-base modality quality weight combining pairwise discriminability and
+    effective rank.
 
-    Modalities where most protein pairs have high cosine similarity (low
-    discriminative power) receive a lower weight.  This prevents noisy or
-    low-information modalities (e.g. SEC-MS with a high similarity floor)
-    from dominating the co-embedding during Stage 1 integration.
+    Two orthogonal signals are used:
 
-    quality_raw = (1 - mean_pairwise_cosine) ^ exponent, floored at *floor*,
-    then rescaled so that the most discriminative modality gets weight 1.0.
+    1. **Discriminability** – ``(1 - mean_pairwise_cosine) ^ exponent``.
+       Penalises modalities where all protein pairs look alike.
+    2. **Effective rank fraction** – ``exp(H(eigenvalue_spectrum)) / max_rank``.
+       Penalises modalities whose embeddings collapse onto a low-dimensional
+       subspace (e.g. shifted copies of the same elution profile).
+
+    The combined quality is a weighted geometric mean of the two scores.
+    The result is floored at *floor* and rescaled so the best modality = 1.0.
+
+    Parameters
+    ----------
+    rank_weight : float
+        Mixing weight for effective rank in [0, 1].
+        ``quality = discrim^(1-rank_weight) * eff_rank^rank_weight``
+        Default 0.3 (discriminability dominates, rank acts as a corrective).
     """
     rng = np.random.RandomState(seed)
 
@@ -221,24 +270,35 @@ def compute_modality_quality_weights(
 
         # L2 normalise
         norms = np.linalg.norm(X, axis=1, keepdims=True)
-        X = X / np.maximum(norms, eps)
+        X_norm = X / np.maximum(norms, eps)
 
+        # ---- signal 1: discriminability (mean pairwise cosine) ----
         N = len(proteins)
         if N <= 500:
-            # full pairwise matrix is feasible
-            S = X @ X.T
+            S = X_norm @ X_norm.T
             sims = S[np.triu_indices(N, k=1)]
         else:
-            # sample random pairs
             n_actual = min(n_pairs, N * (N - 1) // 2)
             i_idx = rng.randint(0, N, size=n_actual)
             j_idx = rng.randint(0, N - 1, size=n_actual)
-            j_idx[j_idx >= i_idx] += 1  # ensure i != j
-            sims = np.sum(X[i_idx] * X[j_idx], axis=1)
+            j_idx[j_idx >= i_idx] += 1
+            sims = np.sum(X_norm[i_idx] * X_norm[j_idx], axis=1)
 
         mean_sim = float(np.mean(sims))
-        quality = max(float(floor), (1.0 - mean_sim) ** float(exponent))
+        discrim = max(eps, (1.0 - mean_sim) ** float(exponent))
+
+        # ---- signal 2: effective rank fraction ----
+        eff_rank = max(eps, _effective_rank_fraction(X, eps=eps))
+
+        # ---- combine via weighted geometric mean ----
+        rw = float(np.clip(rank_weight, 0.0, 1.0))
+        combined = (discrim ** (1.0 - rw)) * (eff_rank ** rw)
+        quality = max(float(floor), combined)
         raw_quality[base] = quality
+
+        print(f"  [quality] {base}: discrim={discrim:.4f}  "
+              f"eff_rank={eff_rank:.4f}  combined={combined:.4f}  "
+              f"quality(floored)={quality:.4f}")
 
     # rescale so max weight = 1.0
     max_q = max(raw_quality.values()) if raw_quality else 1.0
@@ -861,6 +921,7 @@ def fit_predict(
     quality_weight_mode: str = "auto",  # "auto" | "off"
     quality_floor: float = 0.1,
     quality_exponent: float = 1.0,
+    quality_rank_weight: float = 0.3,
 ) -> Iterator[List[Union[str, float]]]:
 
     modality_names = list(modalities_dict.keys())
@@ -907,6 +968,7 @@ def fit_predict(
             modalities_dict, model._base_of,
             floor=float(quality_floor),
             exponent=float(quality_exponent),
+            rank_weight=float(quality_rank_weight),
         )
     else:
         quality_w = {b: 1.0 for b in model._unique_bases}
