@@ -40,7 +40,7 @@ class _MLP(nn.Module):
 
 
 class Stage1(nn.Module):
-    """MUSE-style joint embedding for >=2 modalities with missing-data masking.
+    """ joint embedding for >=2 modalities with missing-data masking.
 
     Parameters
     ----------
